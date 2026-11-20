@@ -1,189 +1,80 @@
+# backend/app/schemas/paper_trading.py
+
 from __future__ import annotations
 
-from typing import Any
+from pydantic import BaseModel, PositiveFloat
 
-import pandas as pd
-import requests  # type: ignore[import-untyped]
-import streamlit as st
-from common import (
-    API_BASE,
-    _format_currency,
-    _format_percentage,
-    _safe_dict,
-    _safe_float,
-    _safe_int,
-    _safe_list,
-    auth_headers,
-    load_paper_accounts,
-    render_hero,
-    render_table,
-)
+# NOTE: Mirrors the style of schemas/portfolio.py — constrained scalar types
+# instead of pydantic Field(...) to avoid static type-checker overload issues.
 
 
-def page_paper_trading():
-    """Paper trading: simulated order execution against live prices."""
+class CreateAccountRequest(BaseModel):
+    """Request to create a paper trading account."""
 
-    render_hero(
-        "Paper Trading",
-        "Simulated trading with realistic slippage, commissions, and mark-to-market tracking.",
-    )
+    name: str = "Paper Account"
+    initial_capital: PositiveFloat = 1000000.0
 
-    headers = auth_headers()
 
-    # --- Account creation ---------------------------------------------------
-    with st.expander("➕ Create Account", expanded=False):
-        col1, col2 = st.columns(2)
-        with col1:
-            acct_name = st.text_input("Account name", value="Paper Account", key="pt_name")
-        with col2:
-            capital = st.number_input(
-                "Initial capital", min_value=1000.0, value=1000000.0, step=1000.0, key="pt_capital"
-            )
-        if st.button("Create Account", key="pt_create"):
-            try:
-                res = requests.post(
-                    f"{API_BASE}/paper-trading/accounts",
-                    json={"name": acct_name, "initial_capital": capital},
-                    headers=headers,
-                    timeout=10,
-                )
-                if res.status_code == 200:
-                    data = res.json()
-                    st.success(f"Created account #{data.get('account_id', 'unknown')}")
-                else:
-                    st.error(res.json().get("detail", "Failed to create account"))
-            except requests.RequestException as exc:
-                st.error(f"Backend error: {exc}")
+class OrderRequest(BaseModel):
+    """Request to submit a paper order.
 
-    accounts = load_paper_accounts()
-    if not accounts:
-        st.info("No paper trading accounts yet. Create one above.")
-        return
+    ``market_price`` and ``volume`` are optional; when omitted the API fetches
+    the latest close/volume for the symbol from the price history.
+    """
 
-    labels = {f"#{a['account_id']} · {a['name']}": a["account_id"] for a in accounts}
-    selected = st.selectbox("Account", list(labels.keys()), key="pt_select")
-    account_id = labels[selected]
+    symbol: str
+    side: str  # BUY or SELL
+    quantity: PositiveFloat
+    order_type: str = "MARKET"  # MARKET or LIMIT
+    limit_price: float | None = None
+    market_price: float | None = None
+    volume: int | None = None
 
-    # --- Account summary ----------------------------------------------------
-    try:
-        summary = requests.get(
-            f"{API_BASE}/paper-trading/accounts/{account_id}/summary",
-            headers=headers,
-            timeout=10,
-        ).json()
-    except requests.RequestException as exc:
-        st.error(f"Backend error: {exc}")
-        return
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Equity", _format_currency(_safe_float(summary.get("equity"))))
-    c2.metric("Cash", _format_currency(_safe_float(summary.get("cash"))))
-    c3.metric(
-        "Total P&L",
-        _format_currency(_safe_float(summary.get("total_pnl"))),
-        delta=_format_percentage(_safe_float(summary.get("total_return_pct"))),
-    )
-    c4.metric("Open Positions", _safe_int(summary.get("open_positions"), 0))
+class OrderResponse(BaseModel):
+    """Response describing a submitted order's execution outcome."""
 
-    curve = _safe_list(summary.get("equity_curve"))
-    if curve:
-        st.subheader("Equity Curve")
-        curve_df = pd.DataFrame(curve)
-        if "timestamp" in curve_df.columns:
-            curve_df["timestamp"] = pd.to_datetime(curve_df["timestamp"], errors="coerce")
-            curve_df = curve_df.dropna(subset=["timestamp"]).set_index("timestamp")
-        if "equity" in curve_df.columns and not curve_df.empty:
-            st.line_chart(curve_df["equity"])
+    id: int
+    account_id: int
+    symbol: str
+    side: str
+    order_type: str
+    status: str
+    requested_quantity: float
+    filled_quantity: float
+    limit_price: float | None = None
+    fill_price: float | None = None
+    commission: float
+    slippage_cost: float
+    realized_pnl: float
+    timestamp: str
+    message: str
 
-    # --- Order entry --------------------------------------------------------
-    st.subheader("Place Order")
 
-    # Preset quantities (§3.3): one click fills the qty field; "Custom" leaves it.
-    st.session_state.setdefault("pt_qty", 10)
-    qcols = st.columns(5)
-    for col, preset_qty in zip(qcols, (10, 50, 100, 500), strict=False):
-        if col.button(f"{preset_qty}", key=f"pt_qty_{preset_qty}"):
-            st.session_state["pt_qty"] = preset_qty
+class AccountSummaryResponse(BaseModel):
+    """Response with current account state and P&L."""
 
-    oc1, oc2, oc3, oc4 = st.columns(4)
-    with oc1:
-        order_symbol = st.text_input("Symbol", value="NABIL", key="pt_symbol")
-    with oc2:
-        order_side = st.selectbox("Side", ["BUY", "SELL"], key="pt_side")
-    with oc3:
-        order_qty = st.number_input("Quantity", min_value=1, step=1, key="pt_qty")
-    with oc4:
-        order_type = st.selectbox("Type", ["MARKET", "LIMIT"], key="pt_type")
+    account_id: int
+    name: str
+    created_at: str
+    initial_capital: float
+    cash: float
+    positions_value: float
+    equity: float
+    realized_pnl: float
+    unrealized_pnl: float
+    total_pnl: float
+    total_return_pct: float
+    open_positions: int
+    order_count: int
+    equity_curve: list[dict]
+    positions: dict[str, dict]
 
-    pc1, pc2 = st.columns(2)
-    with pc1:
-        limit_price = st.number_input(
-            "Limit price (LIMIT only)", min_value=0.0, value=0.0, step=1.0, key="pt_limit"
-        )
-    with pc2:
-        market_price = st.number_input(
-            "Market price (0 = use latest)", min_value=0.0, value=0.0, step=1.0, key="pt_market"
-        )
 
-    # Order value + risk preview (§3.3): only when a price is known up front.
-    est_price = limit_price if order_type == "LIMIT" and limit_price > 0 else market_price
-    if est_price > 0:
-        order_value = order_qty * est_price
-        equity = _safe_float(summary.get("equity"))
-        risk_pct = (order_value / equity * 100) if equity > 0 else 0.0
-        st.caption(
-            f"Est. order value **{_format_currency(order_value)}** "
-            f"≈ **{risk_pct:.1f}%** of equity at Rs.{est_price:,.2f}/share."
-        )
+class AccountListItem(BaseModel):
+    """Lightweight account summary for listings."""
 
-    if st.button("Submit Order", key="pt_submit"):
-        payload: dict[str, Any] = {
-            "symbol": order_symbol,
-            "side": order_side,
-            "quantity": order_qty,
-            "order_type": order_type,
-        }
-        if order_type == "LIMIT" and limit_price > 0:
-            payload["limit_price"] = limit_price
-        if market_price > 0:
-            payload["market_price"] = market_price
-        try:
-            res = requests.post(
-                f"{API_BASE}/paper-trading/accounts/{account_id}/orders",
-                json=payload,
-                headers=headers,
-                timeout=15,
-            )
-            if res.status_code == 200:
-                order = res.json()
-                st.success(f"Order {order['status']}: {order['message']}")
-                st.json(order)
-            else:
-                st.error(res.json().get("detail", "Order failed"))
-        except requests.RequestException as exc:
-            st.error(f"Backend error: {exc}")
-
-    # --- Positions ----------------------------------------------------------
-    positions = _safe_dict(summary.get("positions"))
-    if positions:
-        st.subheader("Positions")
-        st.dataframe(pd.DataFrame(list(positions.values())), use_container_width=True, height=200)
-
-    # --- Trade history ------------------------------------------------------
-    st.subheader("Order History")
-    try:
-        trades = requests.get(
-            f"{API_BASE}/paper-trading/accounts/{account_id}/trades",
-            headers=headers,
-            timeout=10,
-        ).json()
-    except requests.RequestException as exc:
-        st.error(f"Backend error: {exc}")
-        trades = []
-    render_table(
-        pd.DataFrame(trades),
-        key="pt_history",
-        name=f"orders_{account_id}",
-        height=300,
-        empty_msg="No orders yet for this account.",
-    )
+    account_id: int
+    name: str
+    equity: float
+    created_at: str

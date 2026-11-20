@@ -1,1 +1,1 @@
-"""Dashboard applications and UI entrypoints."""
+"""API package."""

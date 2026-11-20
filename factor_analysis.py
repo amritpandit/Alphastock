@@ -1,51 +1,41 @@
+"""Small factor analysis helpers based on PCA."""
+
 from __future__ import annotations
 
-import pandas as pd
-import streamlit as st
-from common import _parse_returns_matrix, render_hero
+from dataclasses import dataclass
+
+import numpy as np
 
 
-def page_factor_analysis():
-    """Local factor analysis for uploaded return series."""
+@dataclass
+class FactorResult:
+    factors: np.ndarray
+    loadings: np.ndarray
+    explained_variance: np.ndarray
 
-    render_hero(
-        "Factor Analysis",
-        "Upload or paste returns data to inspect latent drivers, exposures, and attribution.",
-    )
 
-    uploaded = st.file_uploader("CSV returns matrix", type=["csv"], key="factor_upload")
-    raw_csv = st.text_area(
-        "Or paste CSV",
-        value="AAA,BBB,CCC\n0.01,0.02,0.03\n0.02,0.01,0.00\n-0.01,0.03,0.02",
-        height=160,
-        key="factor_csv",
-    )
-    n_factors = st.slider("Number of factors", min_value=1, max_value=5, value=2, key="factor_n")
+class FactorAnalysisService:
+    def compute_factors(self, returns: np.ndarray, n_factors: int = 3) -> FactorResult:
+        if returns.ndim != 2:
+            raise ValueError("returns must be a 2D array")
+        centered = returns - returns.mean(axis=0, keepdims=True)
+        u, s, vt = np.linalg.svd(centered, full_matrices=False)
+        k = min(n_factors, vt.shape[0])
+        factors = u[:, :k] * s[:k]
+        loadings = vt[:k, :].T
+        explained = (s[:k] ** 2) / np.sum(s**2) if np.sum(s**2) else np.zeros(k)
+        return FactorResult(factors=factors, loadings=loadings, explained_variance=explained)
 
-    if st.button("Run Factor Analysis", key="run_factor_analysis"):
-        try:
-            data = _parse_returns_matrix(uploaded, raw_csv)
-            matrix = data.select_dtypes(include=["number"]).to_numpy(dtype=float)
-            if matrix.size == 0:
-                st.warning("No numeric data found.")
-                return
+    def factor_exposure(self, loadings: np.ndarray, symbols: list[str]) -> dict[str, list[float]]:
+        if loadings.shape[0] != len(symbols):
+            raise ValueError("loadings row count must match symbols")
+        return {symbol: loadings[i].tolist() for i, symbol in enumerate(symbols)}
 
-            from app.services.factor_analysis import FactorAnalysisService
-
-            service = FactorAnalysisService()
-            result = service.compute_factors(matrix, n_factors=n_factors)
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Rows", matrix.shape[0])
-            c2.metric("Symbols", matrix.shape[1])
-            c3.metric("Factors", result.factors.shape[1])
-
-            st.subheader("Explained Variance")
-            st.bar_chart(pd.Series(result.explained_variance))
-
-            st.subheader("Loadings")
-            symbols = list(data.select_dtypes(include=["number"]).columns)
-            exposure = service.factor_exposure(result.loadings, symbols)
-            st.dataframe(pd.DataFrame(exposure).T, use_container_width=True)
-        except Exception as exc:
-            st.error(f"Factor analysis failed: {exc}")
+    def factor_attribution(
+        self, exposures: dict[str, list[float]], factor_returns: list[float]
+    ) -> dict[str, float]:
+        factor_array = np.array(factor_returns, dtype=float)
+        return {
+            symbol: float(np.dot(np.array(weights, dtype=float), factor_array))
+            for symbol, weights in exposures.items()
+        }

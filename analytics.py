@@ -1,118 +1,111 @@
+"""REST API routes for dashboard analytics and alerts (Phase 13)."""
+
 from __future__ import annotations
 
-import pandas as pd
-import requests  # type: ignore[import-untyped]
-import streamlit as st
-from common import (
-    API_BASE,
-    _format_percentage,
-    _safe_list,
-    render_table,
-)
+import logging
+from typing import Annotated, Any
+
+from app.core.security import get_current_user
+from app.db.session import get_db
+from app.models.user import User
+from app.services.alerts import AlertEngine
+from app.services.analytics import AnalyticsService
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/analytics", tags=["analytics"])
+
+DbSession = Annotated[Session, Depends(get_db)]
+CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
-def page_analytics():
-    """Market overview, signal explorer, and portfolio analytics."""  # type: ignore[annotation-unchecked]
+class MarketOverviewResponse(BaseModel):
+    total_stocks: int
+    active_stocks: int
+    latest_date: str | None
+    top_gainers: list[dict[str, Any]]
+    top_losers: list[dict[str, Any]]
 
-    st.header("📉 Analytics")
 
-    tab_market, tab_signals, tab_portfolio, tab_alerts = st.tabs(
-        ["Market Overview", "Signal Explorer", "Portfolio Analytics", "Alert Rules"]
+class SignalExplorerResponse(BaseModel):
+    signals: list[dict[str, Any]]
+    summary: dict[str, Any]
+
+
+class PortfolioAnalyticsRequest(BaseModel):
+    equity_curve: list[float]
+
+
+class PortfolioAnalyticsResponse(BaseModel):
+    total_return: float
+    volatility: float
+    sharpe_ratio: float
+    max_drawdown: float
+    n_periods: int
+
+
+@router.get("/market-overview", response_model=MarketOverviewResponse)
+def market_overview(
+    session: DbSession,
+    top_n: int = Query(default=5, ge=1, le=50),
+) -> MarketOverviewResponse:
+    service = AnalyticsService(session)
+    return MarketOverviewResponse(**service.market_overview(top_n=top_n))
+
+
+@router.get("/signals", response_model=SignalExplorerResponse)
+def explore_signals(
+    session: DbSession,
+    symbol: str | None = Query(default=None),
+    signal_type: str | None = Query(default=None),
+    provider: str | None = Query(default=None),
+    min_confidence: float | None = Query(default=None, ge=0.0, le=1.0),
+    limit: int = Query(default=100, ge=1, le=1000),
+) -> SignalExplorerResponse:
+    service = AnalyticsService(session)
+    result = service.explore_signals(
+        symbol=symbol,
+        signal_type=signal_type,
+        provider=provider,
+        min_confidence=min_confidence,
+        limit=limit,
     )
+    return SignalExplorerResponse(**result)
 
-    with tab_market:
-        top_n = st.slider("Top movers", min_value=3, max_value=20, value=5)
-        try:
-            res = requests.get(f"{API_BASE}/analytics/market-overview?top_n={top_n}", timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Total Stocks", data.get("total_stocks", 0))
-                c2.metric("Active Stocks", data.get("active_stocks", 0))
-                c3.metric("Latest Date", data.get("latest_date") or "—")
-                col_g, col_l = st.columns(2)
-                with col_g:
-                    st.subheader("Top Gainers")
-                    gainers = _safe_list(data.get("top_gainers"))
-                    st.dataframe(
-                        pd.DataFrame(gainers), use_container_width=True
-                    ) if gainers else st.info("No data.")
-                with col_l:
-                    st.subheader("Top Losers")
-                    losers = _safe_list(data.get("top_losers"))
-                    st.dataframe(
-                        pd.DataFrame(losers), use_container_width=True
-                    ) if losers else st.info("No data.")
-            else:
-                st.warning("Market overview unavailable.")
-        except requests.RequestException as exc:
-            st.error(f"Backend error: {exc}")
 
-    with tab_signals:
-        col1, col2, col3 = st.columns(3)
-        symbol = col1.text_input("Symbol filter", value="", key="an_sym")
-        signal_type = col2.text_input("Signal type", value="", key="an_type")
-        min_conf = col3.slider("Min confidence", 0.0, 1.0, 0.0, key="an_conf")
-        params: dict[str, str | float] = {"min_confidence": min_conf}
-        if symbol:
-            params["symbol"] = symbol
-        if signal_type:
-            params["signal_type"] = signal_type
-        try:
-            res = requests.get(f"{API_BASE}/analytics/signals", params=params, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                st.json(data.get("summary", {}))
-                render_table(
-                    pd.DataFrame(_safe_list(data.get("signals"))),
-                    key="an_signals",
-                    name="analytics_signals",
-                    height=350,
-                    empty_msg="No signals match the filters.",
-                )
-            else:
-                st.warning("Signal explorer unavailable.")
-        except requests.RequestException as exc:
-            st.error(f"Backend error: {exc}")
+@router.post("/portfolio", response_model=PortfolioAnalyticsResponse)
+def portfolio_analytics(
+    request: PortfolioAnalyticsRequest,
+    session: DbSession,
+) -> PortfolioAnalyticsResponse:
+    service = AnalyticsService(session)
+    return PortfolioAnalyticsResponse(**service.portfolio_analytics(request.equity_curve))
 
-    with tab_portfolio:
-        st.caption("Enter a comma-separated equity curve to compute analytics.")
-        raw = st.text_area("Equity curve", value="100, 102, 101, 105, 108")
-        if st.button("Compute Analytics"):
-            try:
-                curve = [float(x.strip()) for x in raw.split(",") if x.strip()]
-                res = requests.post(
-                    f"{API_BASE}/analytics/portfolio", json={"equity_curve": curve}, timeout=10
-                )
-                if res.status_code == 200:
-                    data = res.json()
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Total Return", _format_percentage(data["total_return"] * 100))
-                    c2.metric("Volatility", _format_percentage(data["volatility"] * 100))
-                    c3.metric("Sharpe", f"{data['sharpe_ratio']:.2f}")
-                    c4.metric("Max Drawdown", _format_percentage(data["max_drawdown"] * 100))
-                else:
-                    st.warning("Portfolio analytics unavailable.")
-            except (ValueError, requests.RequestException) as exc:
-                st.error(f"Error: {exc}")
 
-    with tab_alerts:
-        st.caption("Evaluate alert rules against current data.")
-        symbol = st.text_input("Symbol", value="NABIL", key="alert_sym")
-        threshold = st.number_input("Price change threshold (%)", value=5.0)
-        if st.button("Evaluate Price Alert"):
-            rules = [{"kind": "price_change_pct", "symbol": symbol, "threshold_pct": threshold}]
-            try:
-                res = requests.post(
-                    f"{API_BASE}/alerts/evaluate", json={"rules": rules}, timeout=10
-                )
-                if res.status_code == 200:
-                    data = res.json()
-                    st.metric("Alerts Triggered", data.get("count", 0))
-                    alerts = _safe_list(data.get("alerts"))
-                    if alerts:
-                        st.dataframe(pd.DataFrame(alerts), use_container_width=True)
-                else:
-                    st.warning("Alert evaluation unavailable.")
-            except requests.RequestException as exc:
-                st.error(f"Backend error: {exc}")
+# ------------------------------------------------------------------------- alerts
+alerts_router = APIRouter(prefix="/alerts", tags=["alerts"])
+
+
+class AlertRulesRequest(BaseModel):
+    """A list of declarative alert rules to evaluate."""
+
+    rules: list[dict[str, Any]]
+
+
+class AlertsResponse(BaseModel):
+    count: int
+    alerts: list[dict[str, Any]]
+
+
+@alerts_router.post("/evaluate", response_model=AlertsResponse)
+def evaluate_alerts(
+    request: AlertRulesRequest,
+    user: CurrentUser,
+    session: DbSession,
+) -> AlertsResponse:
+    """Evaluate alert rules against current market/signal data."""
+    engine = AlertEngine(session)
+    alerts = engine.evaluate_rules(request.rules)
+    return AlertsResponse(count=len(alerts), alerts=[a.to_dict() for a in alerts])

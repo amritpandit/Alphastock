@@ -1,29 +1,68 @@
-from __future__ import annotations
+from typing import Annotated
 
-import datetime as dt
-
-import streamlit as st
-from common import (
-    load_features,
+from app.core.security import get_current_user
+from app.db.session import get_db
+from app.models.user import User
+from app.schemas.feature import (
+    FeatureBatchRequest,
+    FeatureBatchResponse,
+    FeatureResponse,
+    MultiStockFeatureRequest,
+    MultiStockFeatureResponse,
 )
+from app.services.data_quality_gate import DataQualityGate
+from app.services.feature import FeatureService
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+router = APIRouter(prefix="/features", tags=["features"])
+DbSession = Annotated[Session, Depends(get_db)]
+CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
-def page_features():
-    """Feature generation and analysis."""  # type: ignore[annotation-unchecked]
+@router.post("/generate", response_model=FeatureResponse)
+def generate_features(
+    symbol: str, date_str: str, user: CurrentUser, db: DbSession
+) -> FeatureResponse:
+    service = FeatureService(gate=DataQualityGate(session=db), session=db)
+    try:
+        result = service.compute_features(symbol, date_str)
+        return FeatureResponse(**result)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
-    st.header("🔧 Features")
 
-    symbol = st.text_input("Symbol", value="NABIL", key="features_symbol")
-    date_str = st.text_input(
-        "Date (YYYY-MM-DD)", value=dt.date.today().isoformat(), key="features_date"
-    )
+@router.post("/generate-batch", response_model=FeatureBatchResponse)
+def generate_features_batch(
+    request: FeatureBatchRequest,
+    user: CurrentUser,
+    db: DbSession,
+) -> FeatureBatchResponse:
+    service = FeatureService(gate=DataQualityGate(session=db), session=db)
+    try:
+        result = service.compute_features_batch(
+            request.symbol,
+            request.start_date,
+            request.end_date,
+        )
+        return FeatureBatchResponse(**result)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
-    if st.button("Generate Features", key="gen_features"):
-        with st.spinner("Generating features..."):
-            features = load_features(symbol, date_str)
-            if features:
-                st.json(features)
-            else:
-                st.warning(
-                    "No feature data available. Feature generation endpoint not implemented."
-                )
+
+@router.post("/generate-multi", response_model=MultiStockFeatureResponse)
+def generate_features_multi(
+    request: MultiStockFeatureRequest,
+    user: CurrentUser,
+    db: DbSession,
+) -> MultiStockFeatureResponse:
+    service = FeatureService(gate=DataQualityGate(session=db), session=db)
+    try:
+        result = service.compute_features_multi_stock(
+            request.symbols,
+            request.start_date,
+            request.end_date,
+        )
+        return MultiStockFeatureResponse(**result)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e

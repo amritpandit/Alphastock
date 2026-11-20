@@ -1,38 +1,31 @@
 from __future__ import annotations
 
-import datetime as dt
+from typing import Any
 
-import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
-from common import (
-    load_signals,
-    render_table,
-)
+from pydantic import BaseModel
 
 
-def page_signals():
-    """Signal visualization and management."""  # type: ignore[annotation-unchecked]
+class ProviderQuotaResponse(BaseModel):
+    provider: str
+    date: str
+    request_count: int
+    signal_count: int
+    updated_count: int
+    success_count: int
+    failure_count: int
+    skipped_count: int
+    token_count: int
+    cost: float
+    metadata: dict[str, Any] | None = None
 
-    st.header("📈 Signals")
 
-    signals_date = st.text_input(
-        "Signals Date (YYYY-MM-DD)", value=dt.date.today().isoformat(), key="signals_date"
-    )
-
-    if st.button("Load Signals", key="load_signals"):
-        signals = load_signals(signals_date)
-        if signals:
-            df_signals = pd.DataFrame(signals)
-            render_table(df_signals, key="signals", name=f"signals_{signals_date}")
-
-            # Signal distribution chart
-            if "signal_type" in df_signals.columns:
-                signal_counts = df_signals.groupby("signal_type").size()
-                fig = go.Figure(data=[go.Bar(x=signal_counts.index, y=signal_counts.values)])
-                fig.update_layout(
-                    title="Signal Distribution", xaxis_title="Signal Type", yaxis_title="Count"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No signals found for this date.")
+class ProviderQuotaSummaryResponse(BaseModel):
+    date: str
+    providers: list[ProviderQuotaResponse]
+    total_request_count: int
+    total_signal_count: int
+    total_success_count: int
+    total_failure_count: int
+    total_skipped_count: int
+    total_token_count: int
+    total_cost: float

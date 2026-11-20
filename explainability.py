@@ -1,103 +1,215 @@
+"""REST API routes for model explainability and governance (Phase 11)."""
+
 from __future__ import annotations
 
-import pandas as pd
-import plotly.graph_objects as go
-import requests  # type: ignore[import-untyped]
-import streamlit as st
-from common import (
-    API_BASE,
-    _safe_list,
-    render_table,
+import logging
+import sys
+from pathlib import Path
+from typing import Annotated
+
+from app.core.security import get_current_user
+from app.db.session import get_db
+from app.models.model_registry import ModelRegistry
+from app.models.user import User
+from app.schemas.explainability import (
+    ExplainRequest,
+    FeatureContributionSchema,
+    GlobalImportanceResponse,
+    GovernanceActionRequest,
+    GovernanceStatusResponse,
+    GovernanceSubmitRequest,
+    LocalExplanationResponse,
 )
+from app.services.model_governance import GovernanceError, ModelGovernanceService
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
+
+_workspace_root = Path(__file__).parent.parent.parent.parent
+if str(_workspace_root) not in sys.path:
+    sys.path.insert(0, str(_workspace_root))
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/explain", tags=["explainability"])
+
+DbSession = Annotated[Session, Depends(get_db)]
+CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
-def page_explainability():
-    """Feature importance and governance for trained models."""  # type: ignore[annotation-unchecked]
+def _resolve_entry(session: Session, model_id: str) -> ModelRegistry:
+    import sqlalchemy as sa
 
-    st.header("🔍 Explainability & Governance")
-
-    model_id = st.text_input("Model ID or version", value="")
-    if not model_id:
-        st.info("Enter a model ID (see ML Models page) to view explanations.")
-        return
-
-    tab_imp, tab_gov = st.tabs(["Feature Importance", "Governance"])
-
-    with tab_imp:
-        top_k = st.slider("Top features", 3, 30, 10)
-        try:
-            res = requests.get(
-                f"{API_BASE}/explain/models/{model_id}/importance?top_k={top_k}", timeout=20
+    query = session.query(ModelRegistry)
+    entry = None
+    if model_id.isdigit():
+        entry = query.filter(ModelRegistry.id == int(model_id)).first()
+    if entry is None:
+        entry = query.filter(
+            sa.or_(
+                ModelRegistry.version == model_id,
+                ModelRegistry.version == f"v{model_id}",
+                ModelRegistry.version.contains(model_id),
             )
-            if res.status_code == 200:
-                data = res.json()
-                st.caption(f"Method: {data.get('method')}")
-                df = pd.DataFrame(_safe_list(data.get("importances")))
-                if not df.empty:
-                    df = df.sort_values(
-                        "contribution",
-                        key=lambda s: s.abs(),
-                        ascending=False,
-                    )
-                    # Waterfall of feature contributions (§ Week 9) — inherits theme.
-                    fig = go.Figure(
-                        go.Waterfall(
-                            orientation="v",
-                            x=df["feature"].astype(str).tolist(),
-                            y=df["contribution"].tolist(),
-                            connector={"line": {"color": "rgba(100,116,139,0.4)"}},
-                        )
-                    )
-                    fig.update_layout(title="Feature Contributions", yaxis_title="Contribution")
-                    st.plotly_chart(fig, use_container_width=True)
-                render_table(
-                    df,
-                    key=f"explain_imp_{model_id}",
-                    name=f"importance_{model_id}",
-                )
-            elif res.status_code == 404:
-                st.warning("Model not found.")
-            else:
-                st.warning("Importance unavailable.")
-        except requests.RequestException as exc:
-            st.error(f"Backend error: {exc}")
+        ).first()
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Model not found")
+    return entry
 
-    with tab_gov:
-        try:
-            res = requests.get(f"{API_BASE}/governance/models/{model_id}", timeout=10)
-            if res.status_code == 200:
-                status = res.json()
-                st.metric("Governance Status", status.get("governance_status", "—"))
-                st.metric("Production Ready", "Yes" if status.get("production_ready") else "No")
-                st.json(status.get("governance", {}))
-            elif res.status_code == 404:
-                st.warning("Model not found.")
-        except requests.RequestException as exc:
-            st.error(f"Backend error: {exc}")
 
-        st.divider()
-        reviewer = st.text_input("Reviewer", value="researcher")
-        notes = st.text_input("Notes", value="")
-        c1, c2, c3, c4 = st.columns(4)
-        action = None
-        if c1.button("Submit"):
-            action = ("submit", {"notes": notes})
-        if c2.button("Approve"):
-            action = ("approve", {"reviewer": reviewer, "notes": notes})
-        if c3.button("Reject"):
-            action = ("reject", {"reviewer": reviewer, "notes": notes})
-        if c4.button("Mark Production"):
-            action = ("production", {"reviewer": reviewer, "notes": notes})
-        if action:
-            verb, payload = action
-            try:
-                res = requests.post(
-                    f"{API_BASE}/governance/models/{model_id}/{verb}", json=payload, timeout=10
-                )
-                if res.status_code == 200:
-                    st.success(f"{verb.title()} succeeded.")
-                    st.json(res.json())
-                else:
-                    st.error(res.json().get("detail", "Action failed."))
-            except requests.RequestException as exc:
-                st.error(f"Backend error: {exc}")
+@router.get("/models/{model_id}/importance", response_model=GlobalImportanceResponse)
+def global_importance(
+    model_id: str,
+    session: DbSession,
+    top_k: int = Query(default=10, ge=1, le=50),
+) -> GlobalImportanceResponse:
+    """Global feature importance for a trained model."""
+    from ml.explainability import ExplainabilityService
+    from ml.model_io import safe_load_model
+
+    entry = _resolve_entry(session, model_id)
+    try:
+        model = safe_load_model(entry.model_artifact_path)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    service = ExplainabilityService()
+    result = service.global_importance(model, top_k=top_k)
+    return GlobalImportanceResponse(
+        model_id=str(entry.id),
+        model_name=entry.name,
+        method=result.method,
+        importances=[FeatureContributionSchema(**c.to_dict()) for c in result.importances],
+    )
+
+
+@router.post("/models/{model_id}/predict", response_model=LocalExplanationResponse)
+def explain_prediction(
+    model_id: str,
+    request: ExplainRequest,
+    session: DbSession,
+) -> LocalExplanationResponse:
+    """Explain a single prediction with per-feature attribution."""
+    import numpy as np
+
+    from ml.explainability import ExplainabilityService, explain_trade
+    from ml.feature_vector import build_feature_vector
+    from ml.model_io import safe_load_model
+
+    entry = _resolve_entry(session, model_id)
+    try:
+        model = safe_load_model(entry.model_artifact_path)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    vector = build_feature_vector(request.feature_values)
+    service = ExplainabilityService()
+    explanation = service.explain_prediction(model, vector, top_k=request.top_k)
+
+    confidence = None
+    try:
+        x = vector.reshape(1, -1)
+        if hasattr(model, "predict_proba"):
+            confidence = float(np.max(model.predict_proba(x)[0]))
+    except Exception:  # pragma: no cover - defensive
+        confidence = None
+
+    trade_expl = None
+    if request.symbol:
+        trade_expl = explain_trade(
+            symbol=request.symbol,
+            signal_type=request.signal_type,
+            prediction=explanation.prediction,
+            explanation=explanation,
+            confidence=confidence,
+        )
+
+    return LocalExplanationResponse(
+        model_id=str(entry.id),
+        method=explanation.method,
+        prediction=explanation.prediction,
+        base_value=explanation.base_value,
+        contributions=[FeatureContributionSchema(**c.to_dict()) for c in explanation.contributions],
+        trade_explanation=trade_expl,
+    )
+
+
+# --------------------------------------------------------------------- governance
+gov_router = APIRouter(prefix="/governance", tags=["governance"])
+
+
+@gov_router.get("/models", response_model=list[GovernanceStatusResponse])
+def list_governance(
+    session: DbSession,
+    state: str | None = Query(default=None),
+) -> list[GovernanceStatusResponse]:
+    service = ModelGovernanceService(session)
+    try:
+        return [GovernanceStatusResponse(**s) for s in service.list_by_state(state)]
+    except GovernanceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@gov_router.get("/models/{model_id}", response_model=GovernanceStatusResponse)
+def governance_status(model_id: str, session: DbSession) -> GovernanceStatusResponse:
+    service = ModelGovernanceService(session)
+    try:
+        return GovernanceStatusResponse(**service.get_status(model_id))
+    except GovernanceError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@gov_router.post("/models/{model_id}/submit", response_model=GovernanceStatusResponse)
+def submit_for_approval(
+    model_id: str,
+    request: GovernanceSubmitRequest,
+    user: CurrentUser,
+    session: DbSession,
+) -> GovernanceStatusResponse:
+    service = ModelGovernanceService(session)
+    try:
+        return GovernanceStatusResponse(**service.submit_for_approval(model_id, request.notes))
+    except GovernanceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@gov_router.post("/models/{model_id}/approve", response_model=GovernanceStatusResponse)
+def approve_model(
+    model_id: str,
+    request: GovernanceActionRequest,
+    user: CurrentUser,
+    session: DbSession,
+) -> GovernanceStatusResponse:
+    service = ModelGovernanceService(session)
+    try:
+        return GovernanceStatusResponse(
+            **service.approve(model_id, request.reviewer, request.notes)
+        )
+    except GovernanceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@gov_router.post("/models/{model_id}/reject", response_model=GovernanceStatusResponse)
+def reject_model(
+    model_id: str,
+    request: GovernanceActionRequest,
+    user: CurrentUser,
+    session: DbSession,
+) -> GovernanceStatusResponse:
+    service = ModelGovernanceService(session)
+    try:
+        return GovernanceStatusResponse(**service.reject(model_id, request.reviewer, request.notes))
+    except GovernanceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@gov_router.post("/models/{model_id}/production", response_model=GovernanceStatusResponse)
+def mark_production_ready(
+    model_id: str,
+    request: GovernanceActionRequest,
+    user: CurrentUser,
+    session: DbSession,
+) -> GovernanceStatusResponse:
+    service = ModelGovernanceService(session)
+    try:
+        return GovernanceStatusResponse(**service.mark_production_ready(model_id, request.reviewer))
+    except GovernanceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
